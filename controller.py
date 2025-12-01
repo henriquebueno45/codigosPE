@@ -5,9 +5,7 @@ from state_machine import StateMachine
 from shared import event_queue, serial_ctrl
 import time
 
-event_queue = Queue()
-
-vision = VisionSystem(event_queue)
+vision = VisionSystem()
 machine = StateMachine()
 
 def vision_thread():

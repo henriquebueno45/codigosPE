@@ -37,7 +37,8 @@ web_data = {
     "last_conf": 0.0,
     "obj_detected":False,
     "tool_identified": False,
-    "label_detected_object": None
+    "label_detected_object": None,
+    "count_fail": 0
 }
 
 web_lock = threading.Lock()

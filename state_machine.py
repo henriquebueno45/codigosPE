@@ -8,11 +8,22 @@ class StateMachine:
     def __init__(self):
         self.state = "INICIAL"
         self.await_tool_since = None
+        # retries for awaiting tool identification
+        self.await_tool_retries = 0
+        self.await_tool_max_retries = 3
         self.state_timestamp = time.time()
+        # tempo (s) para aguardar identificação da ferramenta após receber sinal do serial
+        self.await_tool_timeout = 10.0
 
     def _set_state(self, new_state):
         self.state = new_state
         self.state_timestamp = time.time()
+        # update web state (for UI) under lock
+        try:
+            with shared.web_lock:
+                shared.web_data['state'] = self.state
+        except Exception:
+            pass
 
     def _read_serial(self, attempts=4, wait=0.05):
         """Try reading serial multiple times to avoid transient None reads."""
@@ -34,6 +45,14 @@ class StateMachine:
             return
 
         e = event['type']
+
+        # Normalize event names (Portuguese/English differences)
+        if e == 'OBJETO_DETECTADO':
+            e = 'OBJ_DETECTED'
+        elif e == 'OBJETO_PASSOU_LINHA':
+            e = 'OBJ_DETECTED'
+        elif e == 'CAMERA_INICIALIZADA':
+            e = 'CAM_ONLINE'
 
         # INITIALIZATION
         if e == "INICIAL":
@@ -98,6 +117,8 @@ class StateMachine:
             if lbl:
                 shared.web_data['label_detected_object'] = lbl
                 shared.web_data['tool_identified'] = True
+            # reset retries because we got a success
+            self.await_tool_retries = 0
             # if we are idle, trigger the pick sequence
             if self.state == "IDLE":
                 try:
@@ -119,6 +140,8 @@ class StateMachine:
                 if shared.web_data.get("label_detected_object") is not False:
                     shared.serial_ctrl.write(5)
                     self._set_state("OBJ_DEFINED")
+                    # reset retries as we have now confirmed
+                    self.await_tool_retries = 0
             elif value == 4 and not shared.web_data.get("tool_identified"):
                 # start waiting for the vision system to confirm the tool
                 print("[OBJ_DETECTED] Waiting for tool identification (AWAIT_TOOL_IDENT)")
@@ -126,6 +149,8 @@ class StateMachine:
                     self.await_tool_since = time.time()
                 except Exception:
                     self.await_tool_since = None
+                # reset retries when we start waiting
+                self.await_tool_retries = 0
                 self._set_state("AWAIT_TOOL_IDENT")
             return
 
@@ -142,10 +167,26 @@ class StateMachine:
 
             now = time.time()
             since = self.await_tool_since or self.state_timestamp
-            if now - since > 3.0:
-                print("[AWAIT_TOOL_IDENT] Timeout waiting for tool identification; aborting to IDLE")
-                shared.web_data["obj_detected"] = False
-                shared.web_data["tool_identified"] = False
+            if now - since > self.await_tool_timeout:
+                # if we still have retries, ask vision for a re-check and re-arm the timer
+                if self.await_tool_retries < self.await_tool_max_retries:
+                    print("[AWAIT_TOOL_IDENT] Timeout waiting for identification; requesting recheck from vision")
+                    try:
+                        shared.vision_queue.put({"type": "REQUEST_IDENTIFICATION"})
+                    except Exception:
+                        pass
+                    self.await_tool_retries += 1
+                    # reset timer and stay in AWAIT_TOOL_IDENT
+                    try:
+                        self.await_tool_since = time.time()
+                    except Exception:
+                        self.await_tool_since = None
+                    return
+                # otherwise fallback to safe state; keep obj flags so it can be retried if needed
+                print("[AWAIT_TOOL_IDENT] Max rechecks exhausted; aborting to IDLE")
+                # set flags so we can attempt picking again later; back to IDLE
+                shared.web_data["obj_detected"] = True
+                shared.web_data["tool_identified"] = True
                 self._set_state("IDLE")
             return
 
@@ -157,18 +198,19 @@ class StateMachine:
                 print("------------------------------------------------------------------------")
                 print("LABEL DETECTED OBJECT:", shared.web_data.get("label_detected_object"))
                 print("------------------------------------------------------------------------")
-                if shared.web_data.get("label_detected_object") == "pliers":
+                lbl = (shared.web_data.get("label_detected_object") or "").strip().lower()
+                if lbl == "pliers":
                     valor = 71  # Adicionar lógica para definir qual objeto vai em qual gondola
-                elif shared.web_data.get("label_detected_object") == "screwdriver":
+                elif lbl == "screwdriver":
                     valor = 72
-                elif shared.web_data.get("label_detected_object") == "hammer":
+                elif lbl == "hammer":
                     valor = 73
-                elif shared.web_data.get("label_detected_object") == "wrench":
+                elif lbl == "wrench":
                     valor = 74
-                elif shared.web_data.get("label_detected_object") == "drill":
+                elif lbl == "drill":
                     valor = 75
                 else:
-                    valor = 76               
+                    valor = 76
                 #valor = 71  # Adicionar lógica para definir qual objeto vai em qual gondola
                 shared.serial_ctrl.write(valor)
                 self.state = "GONDOLA_SET"

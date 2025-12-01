@@ -19,15 +19,33 @@ def get_Object_noYolo(frame, line_frac=0.35):
 
     _, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
 
+    # try to close small gaps in the white contours so slightly-damaged/contoured pieces still form a single blob
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    thresh = cv2.dilate(thresh, kernel, iterations=1)
+
     params = cv2.SimpleBlobDetector_Params()
+    # allow a wider threshold sweep (helps if lighting varies)
+    params.minThreshold = 10
+    params.maxThreshold = 255
+    params.thresholdStep = 10
+
+    # keep looking for white blobs
     params.filterByColor = True
     params.blobColor = 255
+
+    # relax area constraints so partially-seen pieces aren't discarded
     params.filterByArea = True
-    params.minArea = 1500
+    params.minArea = 800    # lowered from 1500
     params.maxArea = 1000000
+
+    # disable strict shape filters (contours with details won't be rejected)
     params.filterByCircularity = False
     params.filterByConvexity = False
     params.filterByInertia = False
+
+    # allow close blobs to be considered separately if needed
+    params.minDistBetweenBlobs = 10
 
     detector = cv2.SimpleBlobDetector_create(params)
     keypoints = detector.detect(thresh)
@@ -185,6 +203,12 @@ class VisionSystem:
         #print("[VISÃO] Inicializado. Modelo carregado (se disponível).")
         # buffer of recent detections to debounce labels (label -> deque[timestamps])
         self.detection_buffer = {}
+        # last isolated crop + bbox to allow rechecks
+        self.last_isolated = None
+        self.last_bbox = None
+        self.last_detection_ts = None
+        # time when we last sent TOOL_IDENTIFIED event to avoid flooding
+        self._last_tool_identified_sent = 0
 
     def open_camera(self, cfg):
         try:
@@ -219,6 +243,40 @@ class VisionSystem:
 
     def loop(self):
         while True:
+            # process any pending control messages for the vision system (e.g., re-check requests)
+            try:
+                r = shared.vision_queue.get_nowait()
+                try:
+                    if isinstance(r, dict) and r.get('type') == 'REQUEST_IDENTIFICATION':
+                        # If we have a recent isolated crop, re-run YOLO on it
+                        if self.last_isolated is not None:
+                            print('[VISÃO] Received REQUEST_IDENTIFICATION; re-running YOLO on last crop')
+                            iso_annot, detections = get_Object_yolo(self.model, self.last_isolated)
+                            # reuse same logic as when detections occur after crossing
+                            if detections:
+                                best = max(detections, key=lambda d: d.get('conf', 0))
+                                label = best.get('label')
+                                conf = float(best.get('conf', 0.0))
+                                now = time.time()
+                                buf = self.detection_buffer.get(label)
+                                if buf is None:
+                                    buf = deque(maxlen=8)
+                                    self.detection_buffer[label] = buf
+                                buf.append(now)
+                                while buf and now - buf[0] > 2.0:
+                                    buf.popleft()
+                                if conf >= 0.6 and len(buf) >= 2:
+                                    shared.web_data["label_detected_object"] = label
+                                    shared.web_data["tool_identified"] = True
+                                    # send event if enough time elapsed since last one
+                                    if now - self._last_tool_identified_sent > 0.8:
+                                        shared.event_queue.put({'type': 'TOOL_IDENTIFIED', 'label': label, 'conf': conf, 'timestamp': now})
+                                        self._last_tool_identified_sent = now
+                except Exception:
+                    pass
+            except Exception:
+                # no pending items
+                pass
             with web_lock:
                 cfg = dict(camera_config)
 
@@ -254,6 +312,11 @@ class VisionSystem:
 
             # 1) run fast detector to isolate object
             annotated, crossed, detected_any, isolated, bbox = get_Object_noYolo(frame)
+            if isolated is not None:
+                # store last isolated crop/bbox for potential rechecks
+                self.last_isolated = isolated.copy()
+                self.last_bbox = bbox
+                self.last_detection_ts = time.time()
             if crossed:
                 event_queue.put({"type": "OBJETO_PASSOU_LINHA"})
                 shared.web_data["obj_detected"] = True
@@ -296,12 +359,15 @@ class VisionSystem:
                         shared.web_data["label_detected_object"] = label
                         shared.web_data["tool_identified"] = True
                         # emit a clear, timestamped event so state machine reacts deterministically
-                        event_queue.put({
+                        # Avoid flooding: only put an event if we haven't recently sent one for the same label
+                        if time.time() - self._last_tool_identified_sent > 0.8:
+                            event_queue.put({
                             'type': 'TOOL_IDENTIFIED',
                             'label': label,
                             'conf': conf,
                             'timestamp': now
-                        })
+                            })
+                            self._last_tool_identified_sent = time.time()
                         print("------------------------------------------------------------")
                         print("OBJETO IDENTIFICADO PELA VISÃO:", label, conf)
                     else:

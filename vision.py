@@ -151,7 +151,7 @@ def get_Object_yolo(model, isolated_img):
 
     try:
         results = model.predict(img, verbose=False)
-        print("YOLO results:", results)
+        #print("YOLO results:", results)
     except Exception as e:
         print(f"[VISÃO] Erro no predict: {e}")
         time.sleep(0.05)
@@ -334,9 +334,9 @@ class VisionSystem:
             iso_annot = None
             detections = []
             if crossed:
-                print("Cruzou a linha, então vai rodar o YOLO")
+                #print("Cruzou a linha, então vai rodar o YOLO")
                 iso_annot, detections = get_Object_yolo(self.model, isolated)
-                print("DETECTIONS APÓS RODAR O YOLO:", detections)
+                #print("DETECTIONS APÓS RODAR O YOLO:", detections)
                 if detections:
                     # choose best detection by confidence
                     best = max(detections, key=lambda d: d.get('conf', 0))

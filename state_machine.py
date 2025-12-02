@@ -14,6 +14,23 @@ class StateMachine:
         self.state_timestamp = time.time()
         # tempo (s) para aguardar identificação da ferramenta após receber sinal do serial
         self.await_tool_timeout = 10.0
+        # publish current gondola positions (if any) to web_data
+        try:
+            with shared.web_lock:
+                # ensure shared.gondolas is a list of dicts; if empty but web_data has labels, create default mapping
+                if not shared.gondolas and shared.web_data.get('gondola_positions'):
+                    arr = shared.web_data.get('gondola_positions')
+                    if isinstance(arr, list) and len(arr) > 0 and not isinstance(arr[0], dict):
+                        newg = []   
+                        print("CRIANDO GONDOLAS AUTOMATICAMENTE - Quantidade de Gôndolas:", len(arr))
+                        for i, lab in enumerate(arr):
+                            newg.append({'label': str(lab), 'position_id': 71 + i})
+                        print(arr)
+                        print("NOVO FORMATO DE GONDOLAS:", newg)
+                        shared.gondolas = newg
+                shared.web_data['gondola_positions'] = list(shared.gondolas) if shared.gondolas else list(shared.web_data.get('gondola_positions', []))
+        except Exception:
+            pass
 
     def _set_state(self, new_state):
         self.state = new_state
@@ -168,7 +185,6 @@ class StateMachine:
             now = time.time()
             since = self.await_tool_since or self.state_timestamp
             if now - since > self.await_tool_timeout:
-                # if we still have retries, ask vision for a re-check and re-arm the timer
                 if self.await_tool_retries < self.await_tool_max_retries:
                     print("[AWAIT_TOOL_IDENT] Timeout waiting for identification; requesting recheck from vision")
                     try:
@@ -176,17 +192,14 @@ class StateMachine:
                     except Exception:
                         pass
                     self.await_tool_retries += 1
-                    # reset timer and stay in AWAIT_TOOL_IDENT
                     try:
                         self.await_tool_since = time.time()
                     except Exception:
                         self.await_tool_since = None
                     return
-                # otherwise fallback to safe state; keep obj flags so it can be retried if needed
                 print("[AWAIT_TOOL_IDENT] Max rechecks exhausted; aborting to IDLE")
-                # set flags so we can attempt picking again later; back to IDLE
-                shared.web_data["obj_detected"] = True
-                shared.web_data["tool_identified"] = True
+                shared.web_data["obj_detected"] = False
+                shared.web_data["tool_identified"] = False
                 self._set_state("IDLE")
             return
 
@@ -198,19 +211,34 @@ class StateMachine:
                 print("------------------------------------------------------------------------")
                 print("LABEL DETECTED OBJECT:", shared.web_data.get("label_detected_object"))
                 print("------------------------------------------------------------------------")
-                lbl = (shared.web_data.get("label_detected_object") or "").strip().lower()
-                if lbl == "pliers":
-                    valor = 71  # Adicionar lógica para definir qual objeto vai em qual gondola
-                elif lbl == "screwdriver":
-                    valor = 72
-                elif lbl == "hammer":
-                    valor = 73
-                elif lbl == "wrench":
-                    valor = 74
-                elif lbl == "drill":
-                    valor = 75
-                else:
-                    valor = 76
+                lbl_raw = (shared.web_data.get("label_detected_object") or "").strip()
+                lbl = lbl_raw.lower()
+                valor = None
+                # first try to resolve via shared.gondolas (list of dicts expected)
+                try:
+                    for g in shared.gondolas:
+                        try:
+                            if isinstance(g, dict) and (g.get('label') or '').strip().lower() == lbl:
+                                valor = int(g.get('position_id'))
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                # fallback to hardcoded mapping
+                if valor is None:
+                    if lbl == "pliers":
+                        valor = 71
+                    elif lbl == "screwdriver":
+                        valor = 72
+                    elif lbl == "hammer":
+                        valor = 73
+                    elif lbl == "wrench":
+                        valor = 74
+                    elif lbl == "saw":
+                        valor = 75
+                    else:
+                        valor = 76
                 #valor = 71  # Adicionar lógica para definir qual objeto vai em qual gondola
                 shared.serial_ctrl.write(valor)
                 self.state = "GONDOLA_SET"
